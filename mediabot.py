@@ -1503,20 +1503,6 @@ def is_user_joined_detailed(user_id, force_refresh=False):
             cached = force_join_cache.get(cache_key)
             if cached and (now - cached[1]) < FORCE_JOIN_CACHE_TTL:
                 return cached[0], []
-        
-        # 2. Check Database Cache (More persistent than memory)
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("SELECT currently_joined FROM firewall_tracking WHERE user_id=%s", (user_id,))
-                    row = c.fetchone()
-                    if row and row[0]:
-                        # Update memory cache from DB
-                        with force_join_cache_lock:
-                            force_join_cache[cache_key] = (True, now)
-                        return True, []
-        except Exception as e:
-            print(f"Firewall DB check error: {e}")
 
     # Get all pending join requests for this user at once
     with get_connection() as conn:
@@ -3470,7 +3456,7 @@ def firewall_hourly_cleanup_scheduler():
         try:
             with get_connection() as conn:
                 with conn.cursor() as c:
-                    c.execute("TRUNCATE firewall_tracking")
+                    c.execute("DELETE FROM firewall_tracking")
             
             # Clear memory cache so the bot performs fresh checks
             with force_join_cache_lock:
@@ -4702,7 +4688,7 @@ def clear_firewall_cmd(message):
 
     with get_connection() as conn:
         with conn.cursor() as c:
-            c.execute("TRUNCATE firewall_tracking")
+            c.execute("DELETE FROM firewall_tracking")
     
     # Clear memory cache so the bot performs fresh checks
     with force_join_cache_lock:
