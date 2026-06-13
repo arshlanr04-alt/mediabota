@@ -141,15 +141,9 @@ cached_admins = set()
 cached_vips = set()
 cached_whitelisted = set()
 cached_force_join = False
-cached_maintenance_mode = False
-cached_media_caption = None
-cached_forward_targets = set()
-
-username_cache = {}
-username_cache_lock = threading.Lock()
 
 def refresh_caches():
-    global cached_force_join, cached_maintenance_mode, cached_media_caption
+    global cached_force_join
     with get_connection() as conn:
         with conn.cursor() as c:
             # Refresh Admins
@@ -168,20 +162,6 @@ def refresh_caches():
             c.execute("SELECT value FROM settings WHERE key='force_join_enabled'")
             row = c.fetchone()
             new_fj = bool(row and row[0] == "true")
-
-            # Refresh Maintenance Mode
-            c.execute("SELECT value FROM settings WHERE key='maintenance_mode'")
-            row = c.fetchone()
-            new_mm = bool(row and row[0] == "true")
-
-            # Refresh Media Caption
-            c.execute("SELECT value FROM settings WHERE key='media_caption'")
-            row = c.fetchone()
-            new_mc = row[0] if row else None
-
-            # Refresh Forward Targets
-            c.execute("SELECT chat_id FROM forward_targets")
-            new_ft = {row[0] for row in c.fetchall()}
             
     with cache_lock:
         cached_admins.clear()
@@ -191,12 +171,8 @@ def refresh_caches():
         cached_whitelisted.clear()
         cached_whitelisted.update(new_whitelisted)
         cached_force_join = new_fj
-        cached_maintenance_mode = new_mm
-        cached_media_caption = new_mc
-        cached_forward_targets.clear()
-        cached_forward_targets.update(new_ft)
     
-    print(f"⚡ Cache refreshed: {len(cached_admins)} admins, {len(cached_vips)} VIPs, {len(cached_whitelisted)} whitelisted, Firewall: {'ON' if new_fj else 'OFF'}, Maintenance: {'ON' if new_mm else 'OFF'}, Log Groups: {len(new_ft)}")
+    print(f"⚡ Cache refreshed: {len(cached_admins)} admins, {len(cached_vips)} VIPs, {len(cached_whitelisted)} whitelisted, Firewall: {'ON' if new_fj else 'OFF'}")
 
 # =========================
 # 🗄 DATABASE CONNECTION
@@ -762,10 +738,6 @@ def grant_global_free_cycle(target="all", hours=12):
 # =========================
 
 def get_username(user_id):
-    with username_cache_lock:
-        if user_id in username_cache:
-            return username_cache[user_id]
-            
     with get_connection() as conn:
         with conn.cursor() as c:
             c.execute(
@@ -773,12 +745,7 @@ def get_username(user_id):
                 (user_id,)
             )
             row = c.fetchone()
-            uname = row[0] if row else None
-            
-    if uname is not None:
-        with username_cache_lock:
-            username_cache[user_id] = uname
-    return uname
+            return row[0] if row else None
 
 
 def set_username(user_id, username):
@@ -789,8 +756,6 @@ def set_username(user_id, username):
                 SET username=%s
                 WHERE user_id=%s
             """, (username.lower(), user_id))
-    with username_cache_lock:
-        username_cache[user_id] = username.lower()
 
 
 def username_taken(username):
@@ -819,19 +784,28 @@ def export_recovery_payload():
         with conn.cursor() as c:
             c.execute(
                 """
-                SELECT username, banned, first_name, last_name, admin_notes, reputation
+                SELECT user_id, username, banned, first_name, last_name, admin_notes, reputation,
+                       tg_username, whitelisted, total_media_sent, last_activation_time, joined_at,
+                       referred_by, passed_firewall_ever
                 FROM users
-                WHERE username IS NOT NULL
-                ORDER BY username
+                ORDER BY user_id
                 """
             )
             users = [{
-                "username": r[0],
-                "banned": bool(r[1]),
-                "first_name": r[2],
-                "last_name": r[3],
-                "admin_notes": r[4],
-                "reputation": r[5]
+                "user_id": r[0],
+                "username": r[1],
+                "banned": bool(r[2]),
+                "first_name": r[3],
+                "last_name": r[4],
+                "admin_notes": r[5],
+                "reputation": r[6],
+                "tg_username": r[7],
+                "whitelisted": bool(r[8]),
+                "total_media_sent": r[9],
+                "last_activation_time": r[10],
+                "joined_at": r[11],
+                "referred_by": r[12],
+                "passed_firewall_ever": bool(r[13])
             } for r in c.fetchall()]
             c.execute("SELECT word FROM banned_words ORDER BY word")
             words = [r[0] for r in c.fetchall()]
@@ -852,26 +826,67 @@ def import_recovery_payload(payload):
     with get_connection() as conn:
         with conn.cursor() as c:
             for item in users:
-                username = str(item.get("username", "")).strip().lower()
-                if not username: continue
+                user_id = item.get("user_id")
+                username = item.get("username")
+                if username:
+                    username = str(username).strip().lower()
+                else:
+                    username = None
+                
                 banned = bool(item.get("banned", False))
                 fname = item.get("first_name")
                 lname = item.get("last_name")
                 notes = item.get("admin_notes")
                 rep = item.get("reputation", "Neutral")
+                tg_username = item.get("tg_username")
+                whitelisted = bool(item.get("whitelisted", False))
+                total_media = item.get("total_media_sent", 0)
+                last_active = item.get("last_activation_time")
+                joined_at = item.get("joined_at")
+                referred_by = item.get("referred_by")
+                passed_firewall = bool(item.get("passed_firewall_ever", False))
 
-                c.execute("""
-                    INSERT INTO recovery_users (username, banned)
-                    VALUES (%s, %s)
-                    ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
-                """, (username, banned))
+                if user_id:
+                    c.execute("""
+                        INSERT INTO users (
+                            user_id, username, banned, first_name, last_name, admin_notes, 
+                            reputation, tg_username, whitelisted, total_media_sent, 
+                            last_activation_time, joined_at, referred_by, passed_firewall_ever
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            username = COALESCE(EXCLUDED.username, users.username),
+                            banned = EXCLUDED.banned,
+                            first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+                            last_name = COALESCE(EXCLUDED.last_name, users.last_name),
+                            admin_notes = COALESCE(EXCLUDED.admin_notes, users.admin_notes),
+                            reputation = EXCLUDED.reputation,
+                            tg_username = COALESCE(EXCLUDED.tg_username, users.tg_username),
+                            whitelisted = EXCLUDED.whitelisted,
+                            total_media_sent = GREATEST(users.total_media_sent, EXCLUDED.total_media_sent),
+                            last_activation_time = COALESCE(EXCLUDED.last_activation_time, users.last_activation_time),
+                            joined_at = COALESCE(EXCLUDED.joined_at, users.joined_at),
+                            referred_by = COALESCE(EXCLUDED.referred_by, users.referred_by),
+                            passed_firewall_ever = EXCLUDED.passed_firewall_ever
+                    """, (
+                        user_id, username, banned, fname, lname, notes, 
+                        rep, tg_username, whitelisted, total_media, 
+                        last_active, joined_at, referred_by, passed_firewall
+                    ))
+                elif username:
+                    c.execute("""
+                        UPDATE users
+                        SET banned = %s, first_name = %s, last_name = %s, admin_notes = %s, reputation = %s
+                        WHERE username = %s
+                    """, (banned, fname, lname, notes, rep, username))
 
-                # Update main users table if they exist
-                c.execute("""
-                    UPDATE users
-                    SET banned = %s, first_name = %s, last_name = %s, admin_notes = %s, reputation = %s
-                    WHERE username = %s
-                """, (banned, fname, lname, notes, rep, username))
+                if username:
+                    c.execute("""
+                        INSERT INTO recovery_users (username, banned)
+                        VALUES (%s, %s)
+                        ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
+                    """, (username, banned))
+                
                 imported_users += 1
 
             for word in words:
@@ -967,13 +982,13 @@ def add_forward_target(chat_id):
                 """,
                 (chat_id,),
             )
-    with cache_lock:
-        cached_forward_targets.add(chat_id)
 
 
 def get_forward_targets():
-    with cache_lock:
-        return list(cached_forward_targets)
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT chat_id FROM forward_targets")
+            return [row[0] for row in c.fetchall()]
 
 def build_prefix(user_id):
 
@@ -1110,8 +1125,14 @@ def warning_action_for_count(warnings):
 # =========================
 
 def is_whitelisted(user_id):
-    with cache_lock:
-        return user_id in cached_whitelisted
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT whitelisted FROM users WHERE user_id=%s",
+                (user_id,)
+            )
+            row = c.fetchone()
+            return row and row[0]
 
 
 def whitelist_user(user_id):
@@ -1121,8 +1142,6 @@ def whitelist_user(user_id):
                 "UPDATE users SET whitelisted=TRUE WHERE user_id=%s",
                 (user_id,)
             )
-    with cache_lock:
-        cached_whitelisted.add(user_id)
     try:
         bot.send_message(
             user_id,
@@ -1139,8 +1158,6 @@ def remove_whitelist(user_id):
                 "UPDATE users SET whitelisted=FALSE WHERE user_id=%s",
                 (user_id,)
             )
-    with cache_lock:
-        cached_whitelisted.discard(user_id)
 # =========================
 # 🚪 JOIN CONTROL
 # =========================
@@ -1166,14 +1183,16 @@ def set_join_status(status: bool):
 
 
 def is_maintenance_mode():
-    with cache_lock:
-        return cached_maintenance_mode
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='maintenance_mode'")
+            row = c.fetchone()
+            return row and row[0] == "true"
 
 def get_maintenance_message():
     return "🚧 *System Maintenance* 🚧\n\nThe bot is currently undergoing scheduled maintenance to improve performance. Please check back in a few minutes.\n\nThank you for your patience! 🙏"
 
 def set_maintenance_mode(status: bool):
-    global cached_maintenance_mode
     val = "true" if status else "false"
     with get_connection() as conn:
         with conn.cursor() as c:
@@ -1182,15 +1201,15 @@ def set_maintenance_mode(status: bool):
                 VALUES ('maintenance_mode', %s)
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             """, (val,))
-    with cache_lock:
-        cached_maintenance_mode = status
 
 def get_media_caption():
-    with cache_lock:
-        return cached_media_caption
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='media_caption'")
+            row = c.fetchone()
+            return row[0] if row else None
 
 def set_media_caption(caption_text: str):
-    global cached_media_caption
     with get_connection() as conn:
         with conn.cursor() as c:
             if not caption_text:
@@ -1204,8 +1223,6 @@ def set_media_caption(caption_text: str):
                     """,
                     (caption_text,)
                 )
-    with cache_lock:
-        cached_media_caption = caption_text if caption_text else None
 
 
 def _normalize_force_join_chat(raw_value):
@@ -3192,151 +3209,12 @@ def handle_admin_pending_inputs(message):
 # 🔁 RELAY HANDLER
 # =========================
 
-def process_album_relay(album):
-    first_msg = album[0]
-    user_id = first_msg.chat.id
-    
-    # Check maintenance first
-    if is_maintenance_mode() and not is_admin(user_id):
-        bot.send_message(user_id, get_maintenance_message(), parse_mode="Markdown")
-        return
-
-    # Check force join
-    if is_force_join_enabled() and not is_admin(user_id) and not is_vip(user_id):
-        is_joined, missing = is_user_joined_detailed(user_id)
-        if not is_joined:
-            if can_send_force_join_reminder(user_id):
-                send_force_join_ui(user_id)
-            for m in album:
-                try:
-                    bot.delete_message(m.chat.id, m.message_id)
-                except Exception:
-                    pass
-            return
-        clear_force_join_ui(user_id)
-
-    # Check duplicates for each item in the album
-    filtered_album = []
-    for m in album:
-        if m.content_type in ['photo', 'video'] and is_duplicate_filter_enabled():
-            if not is_admin(user_id) and not is_vip(user_id) and not is_whitelisted(user_id):
-                file_id = m.photo[-1].file_id if m.content_type == 'photo' else m.video.file_id
-                if check_and_register_duplicate(file_id, user_id):
-                    continue
-        filtered_album.append(m)
-
-    if not filtered_album:
-        return
-
-    # Ensure user exists in database
-    if not user_exists(user_id):
-        add_user(user_id, first_msg.from_user.first_name, first_msg.from_user.last_name, first_msg.from_user.username)
-
-    # Now handle restrictions (inactive / joining checks & media increment)
-    state = get_user_state(user_id)
-    
-    # Admin/VIP/Whitelist Bypass (Global)
-    if state == "ADMIN" or is_vip(user_id) or is_whitelisted(user_id):
-        bypass = True
-    else:
-        bypass = False
-
-    if not bypass:
-        if state == "BANNED":
-            bot.send_message(user_id, "🚫 You are banned.")
-            return
-
-        if state == "NO_USERNAME":
-            bot.send_message(user_id, "⚠️ Please set username first using /start.")
-            return
-
-        media_count = len(filtered_album)
-
-        if state == "JOINING":
-            increment_media(user_id, media_count)
-            activated = check_activation(user_id)
-            if activated:
-                bot.send_message(
-                    user_id,
-                    f"🎉 You are now active for {get_inactivity_limit() // 3600} hours!"
-                )
-            else:
-                remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
-                bot.send_message(
-                    user_id,
-                    f"📸 {remaining} media left to join."
-                )
-            # Send the album
-            broadcast_queue.put({
-                "type": "album",
-                "messages": filtered_album
-            })
-            return
-
-        if state == "INACTIVE":
-            increment_media(user_id, media_count)
-            activated = check_activation(user_id)
-            if activated:
-                bot.send_message(
-                    user_id,
-                    f"🎉 You are reactivated for {get_inactivity_limit() // 3600} hours!"
-                )
-            else:
-                remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
-                bot.send_message(
-                    user_id,
-                    f"📸 {remaining} media left to reactivate."
-                )
-            # Send the album
-            broadcast_queue.put({
-                "type": "album",
-                "messages": filtered_album
-            })
-            return
-
-    # If active/admin/vip/whitelist, increment count and broadcast
-    if not bypass:
-        increment_media(user_id, len(filtered_album))
-        check_activation(user_id)
-
-    broadcast_queue.put({
-        "type": "album",
-        "messages": filtered_album
-    })
-
 @bot.message_handler(
     func=lambda m: not m.text or not m.text.startswith('/'),
     content_types=['text', 'photo', 'video', 'document', 'audio', 'animation']
 )
 def relay(message):
-    # =========================================================================
-    # 🆕 IMMEDIATE ALBUM GROUPING (Must be at the top to prevent splitting!)
-    # =========================================================================
-    if message.media_group_id:
-        group_id = message.media_group_id
-        with album_lock:
-            media_groups[group_id].append(message)
-            last_album_time[group_id] = time.time()
-            if group_id in album_timers:
-                return
-            album_timers[group_id] = True
 
-        def finalize():
-            while True:
-                time.sleep(0.5)
-                with album_lock:
-                    if time.time() - last_album_time.get(group_id, 0) >= 2.0:
-                        album = media_groups.pop(group_id, [])
-                        album_timers.pop(group_id, None)
-                        last_album_time.pop(group_id, None)
-                        break
-            if album:
-                process_album_relay(album)
-
-        threading.Thread(target=finalize, daemon=True).start()
-        return
-
-    # Single message checks below:
     if is_maintenance_mode() and not is_admin(message.chat.id):
         bot.send_message(message.chat.id, "Bot is under maintenance. Try again later.")
         return
@@ -3377,6 +3255,35 @@ def relay(message):
         add_user(message.chat.id, message.from_user.first_name, message.from_user.last_name, message.from_user.username)
 
     if handle_restrictions(message):
+        return
+    # =========================
+    # 1️⃣ TELEGRAM ALBUM
+    # =========================
+    if message.media_group_id:
+        group_id = message.media_group_id
+        with album_lock:
+            media_groups[group_id].append(message)
+            last_album_time[group_id] = time.time()
+            if group_id in album_timers:
+                return
+            album_timers[group_id] = True
+
+        def finalize():
+            while True:
+                time.sleep(0.5)
+                with album_lock:
+                    if time.time() - last_album_time.get(group_id, 0) >= 1.5:
+                        album = media_groups.pop(group_id, [])
+                        album_timers.pop(group_id, None)
+                        last_album_time.pop(group_id, None)
+                        break
+            if album:
+                broadcast_queue.put({
+                    "type": "album",
+                    "messages": album
+                })
+
+        threading.Thread(target=finalize, daemon=True).start()
         return
 
     # =========================
@@ -4987,7 +4894,7 @@ def check_join_callback(call):
 @bot.chat_member_handler()
 def handle_chat_member_update(message):
     new_status = message.new_chat_member.status
-    user_id = message.from_user.id
+    user_id = message.new_chat_member.user.id
     chat_id = str(message.chat.id)
     
     # Check if this chat is part of the firewall
@@ -6240,7 +6147,12 @@ if __name__ == "__main__":
     print("Bot is now polling...")
     while True:
         try:
-            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=60,
+                long_polling_timeout=60,
+                allowed_updates=['message', 'callback_query', 'chat_member', 'chat_join_request', 'channel_post']
+            )
         except telebot.apihelper.ApiTelegramException as e:
             if e.error_code == 429:
                 # Respect Telegram's retry_after duration
