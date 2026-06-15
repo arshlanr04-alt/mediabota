@@ -5568,6 +5568,55 @@ def menu_command(message):
 import http.server
 import socketserver
 
+def run_webhook_server():
+    class WebhookHandler(http.server.SimpleHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == f"/{BOT_TOKEN}":
+                content_length = int(self.headers['Content-Length'])
+                post_data = self.rfile.read(content_length)
+                try:
+                    update_dict = json.loads(post_data.decode('utf-8'))
+                    update = telebot.types.Update.de_json(update_dict)
+                    bot.process_new_updates([update])
+                except Exception as e:
+                    print("Error processing update:", e)
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"OK")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/":
+                self.send_response(200)
+                self.send_header("Content-type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            pass  # Suppress logging of incoming requests to keep logs clean
+
+    port = int(os.environ.get("PORT", 8080))
+    socketserver.TCPServer.allow_reuse_address = True
+    server = socketserver.TCPServer(("0.0.0.0", port), WebhookHandler)
+    
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if external_url:
+        webhook_url = f"{external_url.rstrip('/')}/{BOT_TOKEN}"
+        print(f"Setting webhook to: {webhook_url}")
+        bot.remove_webhook()
+        time.sleep(0.5)
+        bot.set_webhook(url=webhook_url)
+    else:
+        print("Warning: RENDER_EXTERNAL_URL not set. Webhook was not registered.")
+
+    print(f"Webhook server listening on port {port}...")
+    server.serve_forever()
+
 def run_health_check_server():
     class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
@@ -5577,9 +5626,10 @@ def run_health_check_server():
             self.wfile.write(b"OK")
         
         def log_message(self, format, *args):
-            pass  # Suppress logging of incoming requests to keep logs clean
+            pass
 
     port = int(os.environ.get("PORT", 8080))
+    socketserver.TCPServer.allow_reuse_address = True
     server = socketserver.TCPServer(("0.0.0.0", port), HealthCheckHandler)
     print(f"Health check server listening on port {port}...")
     server.serve_forever()
@@ -5596,9 +5646,17 @@ if __name__ == "__main__":
     start_background_workers()
     print("Background workers running.")
 
-    # Start health check server on a background daemon thread
-    threading.Thread(target=run_health_check_server, daemon=True).start()
+    if os.environ.get("RENDER_EXTERNAL_URL"):
+        # Run webhook server on main thread for Render
+        run_webhook_server()
+    else:
+        # Run long polling for local development/testing
+        if os.environ.get("PORT"):
+            threading.Thread(target=run_health_check_server, daemon=True).start()
+        print("Starting local long polling...")
+        bot.remove_webhook()
+        time.sleep(0.5)
+        bot.infinity_polling(skip_pending=True)
 
-    bot.infinity_polling(skip_pending=True)
 
 
