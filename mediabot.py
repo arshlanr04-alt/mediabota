@@ -5565,6 +5565,25 @@ def menu_command(message):
 # 🚀 MAIN BOOT
 # =========================
 
+import http.server
+import socketserver
+
+def run_health_check_server():
+    class HealthCheckHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+        
+        def log_message(self, format, *args):
+            pass  # Suppress logging of incoming requests to keep logs clean
+
+    port = int(os.environ.get("PORT", 8080))
+    server = socketserver.TCPServer(("0.0.0.0", port), HealthCheckHandler)
+    print(f"Health check server listening on port {port}...")
+    server.serve_forever()
+
 if __name__ == "__main__":
 
     print("Starting bot...")
@@ -5577,5 +5596,9 @@ if __name__ == "__main__":
     start_background_workers()
     print("Background workers running.")
 
+    # Start health check server on a background daemon thread
+    threading.Thread(target=run_health_check_server, daemon=True).start()
+
     bot.infinity_polling(skip_pending=True)
+
 
