@@ -1955,8 +1955,8 @@ def referral_command(message):
 # ⚙ CHANGE USERNAME COMMAND
 # =========================
 
-@bot.message_handler(commands=['setsame'])
-def setsame_command(message):
+@bot.message_handler(commands=['setname'])
+def setname_command(message):
     user_id = message.chat.id
     
     # Check if banned
@@ -1975,7 +1975,7 @@ def setsame_command(message):
             user_id,
             "📝 *Change Username*\n\n"
             "To change the username you set in the bot, send the command followed by the new username.\n"
-            "Example: `/setsame mynewusername`",
+            "Example: `/setname mynewusername`",
             parse_mode="Markdown"
         )
         return
