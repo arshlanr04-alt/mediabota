@@ -1952,6 +1952,73 @@ def referral_command(message):
         bot.send_message(user_id, "⚠️ Failed to generate referral link. Try again later.")
 
 # =========================
+# ⚙ CHANGE USERNAME COMMAND
+# =========================
+
+@bot.message_handler(commands=['setsame'])
+def setsame_command(message):
+    user_id = message.chat.id
+    
+    # Check if banned
+    if is_banned(user_id):
+        safe_send_message(user_id, "🚫 You are banned.")
+        return
+
+    # Check maintenance
+    if is_maintenance_mode() and not is_admin(user_id):
+        safe_send_message(user_id, "Bot is under maintenance. Try again later.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        safe_send_message(
+            user_id,
+            "📝 *Change Username*\n\n"
+            "To change the username you set in the bot, send the command followed by the new username.\n"
+            "Example: `/setsame mynewusername`",
+            parse_mode="Markdown"
+        )
+        return
+
+    new_username = parts[1].strip().lower()
+
+    # Basic validations
+    if len(new_username) < 3:
+        safe_send_message(user_id, "❌ Username too short. Minimum 3 characters.")
+        return
+
+    if new_username.startswith('/'):
+        safe_send_message(user_id, "❌ Invalid username.")
+        return
+
+    current_username = get_username(user_id)
+    if current_username == new_username:
+        safe_send_message(user_id, f"⚠️ Your username is already set to `{new_username}`.")
+        return
+
+    if username_taken(new_username):
+        safe_send_message(user_id, "❌ Username already taken. Try another.")
+        return
+
+    # Ensure user exists in database
+    if not user_exists(user_id):
+        add_user(user_id, message.from_user.first_name, message.from_user.last_name, message.from_user.username)
+
+    # Update username
+    set_username(user_id, new_username)
+    
+    # Check if recovery payload marks this new username as banned
+    if get_recovery_ban_for_username(new_username):
+        ban_user(user_id)
+        safe_send_message(user_id, "🚫 Username recovered from backup with banned status.")
+        return
+
+    safe_send_message(
+        user_id,
+        f"✅ Success! Your username has been changed to: `{new_username}`"
+    )
+
+# =========================
 # 🏷 USERNAME CAPTURE
 # =========================
 
