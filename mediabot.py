@@ -3867,7 +3867,7 @@ def info_command(message):
         text = (
             f"💳 <b>USER ID CARD</b>\n"
             f"────────────────────\n"
-            f"👤 <b>Identity:</b> <code>{h_esc(full_name)}</code>\n"
+            f"👤 <b>Identity:</b> <a href=\"tg://user?id={user_id}\">{h_esc(full_name)}</a>\n"
             f"🌐 <b>Alias:</b> <code>{h_esc(display_tg_user)}</code>\n"
             f"🤖 <b>Bot ID:</b> <code>{h_esc(bot_username or 'None')}</code>\n"
             f"🆔 <b>Serial:</b> <code>{user_id}</code>\n"
@@ -3883,16 +3883,21 @@ def info_command(message):
         )
         
         markup = InlineKeyboardMarkup(row_width=2)
-        dm_url = f"https://t.me/{tg_username}" if tg_username else f"tg://user?id={user_id}"
-        
         markup.add(
             InlineKeyboardButton("📂 View Files", callback_data=f"admin_view_files:{user_id}"),
             InlineKeyboardButton("✉️ Message", callback_data=f"admin_msg_user:{user_id}")
         )
-        markup.add(
-            InlineKeyboardButton("👤 Direct DM", url=dm_url),
-            InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
-        )
+        
+        if tg_username:
+            markup.add(
+                InlineKeyboardButton("👤 Direct DM", url=f"https://t.me/{tg_username}"),
+                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
+            )
+        else:
+            markup.add(
+                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
+            )
+            
         markup.add(
             InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{user_id}"),
             InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{user_id}")
@@ -5208,7 +5213,7 @@ def admin_callbacks(call):
         text = (
             f"👤 *USER PROFILE*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔸 *Telegram Name:* `{escape_markdown(full_name)}`\n"
+            f"🔸 *Telegram Name:* [{escape_markdown(full_name)}](tg://user?id={uid})\n"
             f"🔸 *Username:* `{escape_markdown(display_tg_user)}`\n"
             f"🔸 *Bot ID Name:* `{escape_markdown(bot_username or 'Not Set')}`\n"
             f"🔸 *User ID:* `{uid}`\n"
@@ -5225,17 +5230,20 @@ def admin_callbacks(call):
         )
         
         markup = InlineKeyboardMarkup(row_width=2)
-        
-        dm_url = f"https://t.me/{tg_username}" if tg_username else f"tg://user?id={uid}"
-        
         markup.add(
             InlineKeyboardButton("📂 View Files", callback_data=f"admin_view_files:{uid}"),
             InlineKeyboardButton("✉️ Message", callback_data=f"admin_msg_user:{uid}")
         )
-        markup.add(
-            InlineKeyboardButton("👤 Direct DM", url=dm_url),
-            InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}")
-        )
+        
+        if tg_username:
+            markup.add(
+                InlineKeyboardButton("👤 Direct DM", url=f"https://t.me/{tg_username}"),
+                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}")
+            )
+        else:
+            markup.add(
+                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}")
+            )
         
         ban_btn = InlineKeyboardButton("✅ Unban User", callback_data=f"admin_unban_user:{uid}") if is_banned_user else InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{uid}")
 
