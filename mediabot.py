@@ -89,9 +89,19 @@ if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+def safe_send_message(chat_id, *args, **kwargs):
+    try:
+        return bot.send_message(chat_id, *args, **kwargs)
+    except Exception as e:
+        print(f"⚠️ safe_send_message to {chat_id} failed: {e}")
+        return None
+
 broadcast_queue = queue.Queue(maxsize=BROADCAST_QUEUE_SIZE)
 media_groups = defaultdict(list)
 album_timers = {}
+album_lock = threading.Lock()
+last_album_time = {}
 activation_buffer = defaultdict(int)
 activation_timer = {}
 activation_lock = threading.Lock()
@@ -1388,8 +1398,10 @@ def is_user_joined_detailed(user_id, force_refresh=False):
     if not force_refresh:
         with force_join_cache_lock:
             cached = force_join_cache.get(cache_key)
-            if cached and (now - cached[1]) < FORCE_JOIN_CACHE_TTL:
-                return cached[0], []
+            if cached:
+                ttl = 60 if cached[0] else 3  # Cache True for 60s, False for 3s
+                if (now - cached[1]) < ttl:
+                    return cached[0], []
 
     # Get all pending join requests for this user at once
     with get_connection() as conn:
@@ -1526,21 +1538,22 @@ def send_force_join_ui(user_id, prefix_text=None):
             with last_fw_msg_lock:
                 last_fw_msg.pop(int(user_id), None)
 
-    sent = bot.send_message(
+    sent = safe_send_message(
         user_id,
         message,
         reply_markup=markup
     )
-    with last_fw_msg_lock:
-        last_fw_msg[int(user_id)] = sent.message_id
+    if sent:
+        with last_fw_msg_lock:
+            last_fw_msg[int(user_id)] = sent.message_id
 
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("""
-                INSERT INTO firewall_tracking (user_id, msg_received)
-                VALUES (%s, TRUE)
-                ON CONFLICT (user_id) DO UPDATE SET msg_received = TRUE
-            """, (user_id,))
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO firewall_tracking (user_id, msg_received)
+                    VALUES (%s, TRUE)
+                    ON CONFLICT (user_id) DO UPDATE SET msg_received = TRUE
+                """, (user_id,))
 
 
 def clear_force_join_ui(user_id):
@@ -2017,7 +2030,7 @@ def handle_restrictions(message):
 
     # 🚫 Manual Ban
     if state == "BANNED":
-        bot.send_message(user_id, "🚫 You are banned.")
+        safe_send_message(user_id, "🚫 You are banned.")
         return True
 
     # 👑 Admin Bypass
@@ -2035,17 +2048,17 @@ def handle_restrictions(message):
             action = warning_action_for_count(warnings)
             if action == "ban" and not is_whitelisted(user_id):
                 ban_user(user_id)
-                bot.send_message(
+                safe_send_message(
                     user_id,
                     f"🚫 You are banned. Warning limit reached ({warnings}/{MAX_WARNINGS})."
                 )
             elif action == "restrict":
-                bot.send_message(
+                safe_send_message(
                     user_id,
                     f"⏳ Temporary restriction warning ({warnings}/{MAX_WARNINGS}). One more violation may ban you."
                 )
             else:
-                bot.send_message(
+                safe_send_message(
                     user_id,
                     f"⚠️ Warning {warnings}/{MAX_WARNINGS} - banned word detected."
                 )
@@ -2053,7 +2066,7 @@ def handle_restrictions(message):
 
     # ❌ No Username Yet
     if state == "NO_USERNAME":
-        bot.send_message(
+        safe_send_message(
             user_id,
             "⚠️ Please set username first using /start."
         )
@@ -2087,13 +2100,13 @@ def handle_restrictions(message):
                     activated = check_activation(user_id)
 
                     if activated:
-                        bot.send_message(
+                        safe_send_message(
                             user_id,
                             f"🎉 You are now active for {get_inactivity_limit() // 3600} hours!"
                         )
                     else:
                         remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
-                        bot.send_message(
+                        safe_send_message(
                             user_id,
                             f"📸 {remaining} media left to join."
                         )
@@ -2102,7 +2115,7 @@ def handle_restrictions(message):
 
             return False  # allow media relay
 
-        bot.send_message(
+        safe_send_message(
             user_id,
             f"🔒 Send {REQUIRED_MEDIA} media to join."
         )
@@ -2137,13 +2150,13 @@ def handle_restrictions(message):
                     activated = check_activation(user_id)
 
                     if activated:
-                        bot.send_message(
+                        safe_send_message(
                             user_id,
                             f"🎉 You are reactivated for {get_inactivity_limit() // 3600} hours!"
                         )
                     else:
                         remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
-                        bot.send_message(
+                        safe_send_message(
                             user_id,
                             f"📸 {remaining} media left to reactivate."
                         )
@@ -2152,7 +2165,7 @@ def handle_restrictions(message):
 
             return False
 
-        bot.send_message(
+        safe_send_message(
             user_id,
             f"⏳ You are inactive.\nSend {REQUIRED_MEDIA} media to reactivate."
         )
@@ -2999,23 +3012,156 @@ def handle_admin_pending_inputs(message):
 # 🔁 RELAY HANDLER
 # =========================
 
+def process_album_relay(album):
+    first_msg = album[0]
+    user_id = first_msg.chat.id
+    
+    # Check maintenance first
+    if is_maintenance_mode() and not is_admin(user_id):
+        safe_send_message(user_id, "Bot is under maintenance. Try again later.")
+        return
+
+    # Check force join
+    if is_force_join_enabled() and not is_admin(user_id) and not is_vip(user_id):
+        is_joined, missing = is_user_joined_detailed(user_id)
+        if not is_joined:
+            if can_send_force_join_reminder(user_id):
+                send_force_join_ui(user_id)
+            for m in album:
+                try:
+                    bot.delete_message(m.chat.id, m.message_id)
+                except Exception:
+                    pass
+            return
+        clear_force_join_ui(user_id)
+
+    # Check duplicates for each item in the album
+    filtered_album = []
+    for m in album:
+        if m.content_type in ['photo', 'video'] and is_duplicate_filter_enabled():
+            if not is_admin(user_id) and not is_vip(user_id) and not is_whitelisted(user_id):
+                file_id = m.photo[-1].file_id if m.content_type == 'photo' else m.video.file_id
+                if check_and_register_duplicate(file_id, user_id):
+                    continue
+        filtered_album.append(m)
+
+    if not filtered_album:
+        return
+
+    # Ensure user exists in database
+    if not user_exists(user_id):
+        add_user(user_id, first_msg.from_user.first_name, first_msg.from_user.last_name, first_msg.from_user.username)
+
+    # Handle restrictions (inactive / joining checks & media increment)
+    state = get_user_state(user_id)
+    
+    # Admin/VIP/Whitelist Bypass (Global)
+    if state == "ADMIN" or is_vip(user_id) or is_whitelisted(user_id):
+        bypass = True
+    else:
+        bypass = False
+
+    if not bypass:
+        if state == "BANNED":
+            safe_send_message(user_id, "🚫 You are banned.")
+            return
+
+        if state == "NO_USERNAME":
+            safe_send_message(user_id, "⚠️ Please set username first using /start.")
+            return
+
+        media_count = len(filtered_album)
+
+        if state == "JOINING":
+            increment_media(user_id, media_count)
+            activated = check_activation(user_id)
+            if activated:
+                safe_send_message(
+                    user_id,
+                    f"🎉 You are now active for {get_inactivity_limit() // 3600} hours!"
+                )
+            else:
+                remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
+                safe_send_message(
+                    user_id,
+                    f"📸 {remaining} media left to join."
+                )
+            # Send the album
+            broadcast_queue.put({
+                "type": "album",
+                "messages": filtered_album
+            })
+            return
+
+        if state == "INACTIVE":
+            increment_media(user_id, media_count)
+            activated = check_activation(user_id)
+            if activated:
+                safe_send_message(
+                    user_id,
+                    f"🎉 You are reactivated for {get_inactivity_limit() // 3600} hours!"
+                )
+            else:
+                remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
+                safe_send_message(
+                    user_id,
+                    f"📸 {remaining} media left to reactivate."
+                )
+            # Send the album
+            broadcast_queue.put({
+                "type": "album",
+                "messages": filtered_album
+            })
+            return
+
+    # If active or bypassed, send it
+    broadcast_queue.put({
+        "type": "album",
+        "messages": filtered_album
+    })
+
 @bot.message_handler(
     func=lambda m: not m.text or not m.text.startswith('/'),
-    content_types=['text', 'photo', 'video']
+    content_types=['text', 'photo', 'video', 'document', 'audio', 'animation']
 )
 def relay(message):
+    # =========================================================================
+    # 🆕 IMMEDIATE ALBUM GROUPING (Must be at the top to prevent splitting!)
+    # =========================================================================
+    if message.media_group_id:
+        group_id = message.media_group_id
+        with album_lock:
+            media_groups[group_id].append(message)
+            last_album_time[group_id] = time.time()
+            if group_id in album_timers:
+                return
+            album_timers[group_id] = True
 
+        def finalize():
+            while True:
+                time.sleep(0.5)
+                with album_lock:
+                    if time.time() - last_album_time.get(group_id, 0) >= 2.0:
+                        album = media_groups.pop(group_id, [])
+                        album_timers.pop(group_id, None)
+                        last_album_time.pop(group_id, None)
+                        break
+            if album:
+                process_album_relay(album)
+
+        threading.Thread(target=finalize, daemon=True).start()
+        return
+
+    # Single message checks below:
     if is_maintenance_mode() and not is_admin(message.chat.id):
-        bot.send_message(message.chat.id, "Bot is under maintenance. Try again later.")
+        safe_send_message(message.chat.id, "Bot is under maintenance. Try again later.")
         return
 
     if is_force_join_enabled() and not is_admin(message.chat.id) and not is_vip(message.chat.id):
         is_joined, missing = is_user_joined_detailed(message.chat.id)
         if not is_joined:
-            # Only send reminder if cooldown allows, to prevent spam
             if can_send_force_join_reminder(message.chat.id):
                 send_force_join_ui(message.chat.id)
-            
             try:
                 bot.delete_message(message.chat.id, message.message_id)
             except Exception:
@@ -3023,69 +3169,34 @@ def relay(message):
             return
         clear_force_join_ui(message.chat.id)
 
-    # =========================
-    # ♻ DUPLICATE FILTER (EARLY)
-    # =========================
+    # Duplicate Filter
     if message.content_type in ['photo', 'video'] and is_duplicate_filter_enabled():
+        if not is_admin(message.chat.id) and not is_vip(message.chat.id) and not is_whitelisted(message.chat.id):
+            file_id = (
+                message.photo[-1].file_id
+                if message.content_type == 'photo'
+                else message.video.file_id
+            )
+            is_dup = check_and_register_duplicate(file_id, message.chat.id)
+            if is_dup:
+                return
 
-        file_id = (
-            message.photo[-1].file_id
-            if message.content_type == 'photo'
-            else message.video.file_id
-        )
-
-        is_dup = check_and_register_duplicate(file_id, message.chat.id)
-
-        if is_dup:
-            return  # silently ignore and DO NOT count activation
-
-    # 🆕 Ensure user exists in database even if they bypassed /start
+    # Ensure user exists in database
     if not user_exists(message.chat.id):
         add_user(message.chat.id, message.from_user.first_name, message.from_user.last_name, message.from_user.username)
 
     if handle_restrictions(message):
         return
-    # =========================
-    # 1️⃣ TELEGRAM ALBUM
-    # =========================
-    if message.media_group_id:
 
-        group_id = message.media_group_id
-        media_groups[group_id].append(message)
-
-        if group_id in album_timers:
-            return
-
-        album_timers[group_id] = True
-
-        def finalize():
-            time.sleep(1.0)
-
-            album = media_groups.pop(group_id, [])
-            album_timers.pop(group_id, None)
-
-            if album:
-                broadcast_queue.put({
-                    "type": "album",
-                    "messages": album
-                })
-
-        threading.Thread(target=finalize).start()
-        return
-
-    # =========================
-    # 2️⃣ SINGLE PHOTO/VIDEO
-    # =========================
-    if message.content_type in ['photo', 'video']:
+    # Single media
+    if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
         broadcast_queue.put({
             "type": "single",
             "message": message
         })
         return
 
-    # =========================
-    # 3️⃣ TEXT
-    # =========================
+    # Text
     broadcast_queue.put({
         "type": "single",
         "message": message
