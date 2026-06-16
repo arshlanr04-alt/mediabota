@@ -9,6 +9,7 @@ import queue
 import json
 import tempfile
 import random
+import re
 from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -88,7 +89,14 @@ if not BOT_TOKEN:
 if not DATABASE_URL:
     raise RuntimeError("Missing DATABASE_URL")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+class GlobalExceptionHandler(telebot.ExceptionHandler):
+    def handle(self, exception):
+        import traceback
+        print(f"🚨 GlobalExceptionHandler caught exception: {exception}")
+        traceback.print_exc()
+        return True
+
+bot = telebot.TeleBot(BOT_TOKEN, exception_handler=GlobalExceptionHandler())
 
 def safe_send_message(chat_id, *args, **kwargs):
     try:
@@ -96,6 +104,112 @@ def safe_send_message(chat_id, *args, **kwargs):
     except Exception as e:
         print(f"⚠️ safe_send_message to {chat_id} failed: {e}")
         return None
+
+def restrict_user(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE users SET restricted=TRUE WHERE user_id=%s", (user_id,))
+
+def unrestrict_user(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE users SET restricted=FALSE WHERE user_id=%s", (user_id,))
+
+def is_restricted(user_id):
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT restricted FROM users WHERE user_id=%s", (user_id,))
+                row = c.fetchone()
+                return bool(row and row[0])
+    except Exception:
+        return False
+
+def contains_link(message):
+    text = (message.text or "") + (message.caption or "")
+    if not text:
+        return False
+    
+    if message.entities:
+        for entity in message.entities:
+            if entity.type in ['url', 'text_link']:
+                return True
+    if message.caption_entities:
+        for entity in message.caption_entities:
+            if entity.type in ['url', 'text_link']:
+                return True
+
+    url_pattern = re.compile(
+        r'(https?://\S+|www\.\S+|\S+\.\S{2,}(/\S*)?|t\.me/\S+|telegram\.me/\S+)',
+        re.IGNORECASE
+    )
+    if url_pattern.search(text):
+        return True
+        
+    return False
+
+def handle_link_violation(message, is_album=False, album_messages=None):
+    user_id = message.chat.id
+    
+    text = (message.text or "") + (message.caption or "")
+    url_match = re.search(r'(https?://\S+|www\.\S+|\S+\.\S{2,}(/\S*)?|t\.me/\S+|telegram\.me/\S+)', text, re.IGNORECASE)
+    extracted_link = url_match.group(0) if url_match else "Unknown Link"
+    
+    restrict_user(user_id)
+    
+    if is_album and album_messages:
+        for m in album_messages:
+            try:
+                bot.delete_message(m.chat.id, m.message_id)
+            except Exception:
+                pass
+    else:
+        try:
+            bot.delete_message(message.chat.id, message.message_id)
+        except Exception:
+            pass
+            
+    safe_send_message(
+        user_id,
+        "⚠️ *System Warning*\n\n"
+        "You have been temporarily restricted for sending a link. "
+        "Admins have been notified to review your account.",
+        parse_mode="Markdown"
+    )
+    
+    username = get_username(user_id) or "Not Set"
+    tg_user = message.from_user.username or "No Username"
+    first_name = message.from_user.first_name or ""
+    last_name = message.from_user.last_name or ""
+    full_name = f"{first_name} {last_name}".strip() or "Anonymous"
+    
+    admin_text = (
+        f"🚨 *LINK DETECTED & USER RESTRICTED*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 *User:* `{escape_markdown(full_name)}`\n"
+        f"🌐 *Username:* @{escape_markdown(tg_user)}\n"
+        f"🤖 *Bot Username:* `{escape_markdown(username)}`\n"
+        f"🆔 *User ID:* `{user_id}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 *Link Sent:* `{escape_markdown(extracted_link)}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"The user has been temporarily restricted. Choose an action below:"
+    )
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{user_id}"),
+        InlineKeyboardButton("✅ Unrestrict User", callback_data=f"admin_unrestrict_user:{user_id}")
+    )
+    markup.add(
+        InlineKeyboardButton("👤 View Profile", callback_data=f"admin_user_info:{user_id}:0:all")
+    )
+    
+    with cache_lock:
+        admins_to_notify = list(cached_admins)
+        
+    for admin_id in admins_to_notify:
+        safe_send_message(admin_id, admin_text, parse_mode="Markdown", reply_markup=markup)
 
 broadcast_queue = queue.Queue(maxsize=BROADCAST_QUEUE_SIZE)
 media_groups = defaultdict(list)
@@ -267,6 +381,7 @@ def init_db():
                 )
             """)
             c.execute("CREATE INDEX IF NOT EXISTS idx_users_total_media ON users(total_media_sent DESC)")
+            c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS restricted BOOLEAN DEFAULT FALSE")
 
             c.execute("""
                 CREATE TABLE IF NOT EXISTS firewall_tracking (
@@ -1577,6 +1692,9 @@ def get_user_state(user_id):
     if is_banned(user_id):
         return "BANNED"
 
+    if is_restricted(user_id):
+        return "RESTRICTED"
+
     if is_whitelisted(user_id):
         return "ACTIVE"
 
@@ -2098,6 +2216,11 @@ def handle_restrictions(message):
     # 🚫 Manual Ban
     if state == "BANNED":
         safe_send_message(user_id, "🚫 You are banned.")
+        return True
+
+    # 🚫 Temporary Restriction
+    if state == "RESTRICTED":
+        safe_send_message(user_id, "🚫 You are temporarily restricted by the system.")
         return True
 
     # 👑 Admin Bypass
@@ -3083,6 +3206,19 @@ def process_album_relay(album):
     first_msg = album[0]
     user_id = first_msg.chat.id
     
+    # Check if album contains link (exclude admins/vips/whitelisted)
+    if not is_admin(user_id) and not is_vip(user_id) and not is_whitelisted(user_id):
+        has_link = False
+        link_msg = None
+        for m in album:
+            if contains_link(m):
+                has_link = True
+                link_msg = m
+                break
+        if has_link:
+            handle_link_violation(link_msg, is_album=True, album_messages=album)
+            return
+
     # Check maintenance first
     if is_maintenance_mode() and not is_admin(user_id):
         safe_send_message(user_id, "Bot is under maintenance. Try again later.")
@@ -3131,6 +3267,10 @@ def process_album_relay(album):
     if not bypass:
         if state == "BANNED":
             safe_send_message(user_id, "🚫 You are banned.")
+            return
+
+        if state == "RESTRICTED":
+            safe_send_message(user_id, "🚫 You are temporarily restricted by the system.")
             return
 
         if state == "NO_USERNAME":
@@ -3220,6 +3360,11 @@ def relay(message):
         return
 
     # Single message checks below:
+    if not is_admin(message.chat.id) and not is_vip(message.chat.id) and not is_whitelisted(message.chat.id):
+        if contains_link(message):
+            handle_link_violation(message)
+            return
+
     if is_maintenance_mode() and not is_admin(message.chat.id):
         safe_send_message(message.chat.id, "Bot is under maintenance. Try again later.")
         return
@@ -3896,11 +4041,11 @@ def info_command(message):
             with conn.cursor() as c:
                 c.execute("""
                     SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id),
-                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username
+                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.restricted
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
                     WHERE u.user_id = %s
-                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username
+                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.restricted
                 """, (user_id,))
                 row = c.fetchone()
                 
@@ -3908,13 +4053,15 @@ def info_command(message):
             bot.send_message(message.chat.id, "❌ <b>Error:</b> Profile data not found for user ID.")
             return
             
-        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username = row
+        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username, is_restricted_user = row
         now = int(time.time())
         import datetime
         joined_str = datetime.datetime.fromtimestamp(joined_at).strftime('%d %b %Y') if joined_at else "Unknown"
         
         status_str = "🔴 Inactive"
-        if last_active:
+        if is_restricted_user:
+            status_str = "🔴 RESTRICTED"
+        elif last_active:
             time_passed = now - last_active
             time_left = max(0, get_inactivity_limit() - time_passed)
             if time_left > 0:
@@ -3965,10 +4112,17 @@ def info_command(message):
                 InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
             )
             
-        markup.add(
-            InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{user_id}"),
-            InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{user_id}")
-        )
+        if is_restricted_user:
+            markup.add(
+                InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{user_id}"),
+                InlineKeyboardButton("✅ Unrestrict", callback_data=f"admin_unrestrict_user:{user_id}")
+            )
+            markup.add(InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{user_id}"))
+        else:
+            markup.add(
+                InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{user_id}"),
+                InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{user_id}")
+            )
         markup.add(
             InlineKeyboardButton("🔙 Close", callback_data="delete_message")
         )
@@ -5249,11 +5403,11 @@ def admin_callbacks(call):
             with conn.cursor() as c:
                 c.execute("""
                     SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id),
-                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned
+                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned, u.restricted
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
                     WHERE u.user_id = %s
-                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned
+                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned, u.restricted
                 """, (uid,))
                 row = c.fetchone()
         
@@ -5261,13 +5415,13 @@ def admin_callbacks(call):
             bot.answer_callback_query(call.id, "User not found.", show_alert=True)
             return
             
-        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username, is_banned_user = row
+        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username, is_banned_user, is_restricted_user = row
         import datetime, time
         now = int(time.time())
         joined_str = datetime.datetime.fromtimestamp(joined_at).strftime('%d %b %Y') if joined_at else "Unknown"
         
-        status_str = "🔴 BANNED" if is_banned_user else "🔴 Inactive"
-        if not is_banned_user and last_active:
+        status_str = "🔴 BANNED" if is_banned_user else ("🔴 RESTRICTED" if is_restricted_user else "🔴 Inactive")
+        if not is_banned_user and not is_restricted_user and last_active:
             time_passed = now - last_active
             time_left = max(0, get_inactivity_limit() - time_passed)
             if time_left > 0:
@@ -5314,10 +5468,17 @@ def admin_callbacks(call):
         
         ban_btn = InlineKeyboardButton("✅ Unban User", callback_data=f"admin_unban_user:{uid}") if is_banned_user else InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{uid}")
 
-        markup.add(
-            InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{uid}"),
-            ban_btn
-        )
+        if is_restricted_user:
+            markup.add(
+                InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{uid}"),
+                InlineKeyboardButton("✅ Unrestrict", callback_data=f"admin_unrestrict_user:{uid}")
+            )
+            markup.add(ban_btn)
+        else:
+            markup.add(
+                InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{uid}"),
+                ban_btn
+            )
         markup.add(
             InlineKeyboardButton("🔙 Close", callback_data="delete_message")
         )
@@ -5338,6 +5499,15 @@ def admin_callbacks(call):
         uid = int(data.split(":")[1])
         ban_user(uid)
         bot.answer_callback_query(call.id, "🚫 User Banned!", show_alert=True)
+        # Refresh profile
+        call.data = f"admin_user_info:{uid}:0:all"
+        admin_callbacks(call)
+        return
+
+    elif data.startswith("admin_unrestrict_user:"):
+        uid = int(data.split(":")[1])
+        unrestrict_user(uid)
+        bot.answer_callback_query(call.id, "✅ User Unrestricted!", show_alert=True)
         # Refresh profile
         call.data = f"admin_user_info:{uid}:0:all"
         admin_callbacks(call)
