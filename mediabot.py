@@ -13,6 +13,15 @@ import re
 from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+
+# Configure system-wide logging to stdout/stderr
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+)
+# Force telebot's logger to use the same level
+telebot.logger.setLevel(logging.INFO)
 
 def escape_markdown(text):
     if not text:
@@ -91,9 +100,7 @@ if not DATABASE_URL:
 
 class GlobalExceptionHandler(telebot.ExceptionHandler):
     def handle(self, exception):
-        import traceback
-        print(f"🚨 GlobalExceptionHandler caught exception: {exception}")
-        traceback.print_exc()
+        logging.error(f"GlobalExceptionHandler caught exception: {exception}", exc_info=True)
         return True
 
 bot = telebot.TeleBot(BOT_TOKEN, exception_handler=GlobalExceptionHandler())
