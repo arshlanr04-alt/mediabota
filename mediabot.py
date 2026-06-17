@@ -105,12 +105,16 @@ class GlobalExceptionHandler(telebot.ExceptionHandler):
 
 bot = telebot.TeleBot(BOT_TOKEN, exception_handler=GlobalExceptionHandler())
 
-def _is_permanent_error(error):
+def _is_user_permanent_error(error):
     err = str(error).lower()
     return any(x in err for x in ["blocked", "deactivated", "chat not found", "user not found", "forbidden: bot was blocked by the user", "forbidden: user is deactivated"])
 
+def _is_message_permanent_error(error):
+    err = str(error).lower()
+    return any(x in err for x in ["media_file_invalid", "wrong file identifier", "wrong file_id", "message to forward not found", "message is not modified", "can't find message", "message to edit not found"])
+
 def _handle_permanent_error(user_id, error):
-    logging.warning(f"🚫 Permanent error sending to {user_id}: {error}.")
+    logging.warning(f"🚫 User permanent error sending to {user_id}: {error}.")
     try:
         with get_connection() as conn:
             with conn.cursor() as c:
@@ -127,8 +131,10 @@ def safe_send_message(chat_id, *args, **kwargs):
     try:
         return bot.send_message(chat_id, *args, **kwargs)
     except Exception as e:
-        if _is_permanent_error(e):
+        if _is_user_permanent_error(e):
             _handle_permanent_error(chat_id, e)
+        elif _is_message_permanent_error(e):
+            logging.warning(f"⚠️ Message-specific permanent error sending to {chat_id}: {e}")
         else:
             logging.warning(f"⚠️ safe_send_message to {chat_id} failed: {e}")
         return None
@@ -2535,8 +2541,11 @@ def _copy_message_with_retry(user_id, sender_id, message_id, reply_to_message_id
                 time.sleep(FORWARD_DELAY)
             return sent
         except Exception as e:
-            if _is_permanent_error(e):
+            if _is_user_permanent_error(e):
                 _handle_permanent_error(user_id, e)
+                return None
+            if _is_message_permanent_error(e):
+                logging.warning(f"⚠️ Message-specific permanent error: {e}. Skipping retries for {user_id}.")
                 return None
             wait = _retry_after_seconds(e)
             if i < attempts - 1:
@@ -2563,8 +2572,11 @@ def _forward_message_with_retry(user_id, sender_id, message_id, **kwargs):
                 time.sleep(FORWARD_DELAY)
             return sent
         except Exception as e:
-            if _is_permanent_error(e):
+            if _is_user_permanent_error(e):
                 _handle_permanent_error(user_id, e)
+                return None
+            if _is_message_permanent_error(e):
+                logging.warning(f"⚠️ Message-specific permanent error: {e}. Skipping retries for {user_id}.")
                 return None
             wait = _retry_after_seconds(e)
             if i < attempts - 1:
@@ -2609,8 +2621,11 @@ def _send_text_with_retry(user_id, text, reply_to_message_id=None):
                 time.sleep(FORWARD_DELAY)
             return sent
         except Exception as e:
-            if _is_permanent_error(e):
+            if _is_user_permanent_error(e):
                 _handle_permanent_error(user_id, e)
+                return None
+            if _is_message_permanent_error(e):
+                logging.warning(f"⚠️ Message-specific permanent error: {e}. Skipping retries for {user_id}.")
                 return None
             wait = _retry_after_seconds(e)
             if i < attempts - 1:
@@ -2906,8 +2921,11 @@ def _process_album(messages):
                             rows.append((sent.message_id, sender_id, original_message_id, user_id, now))
                     break
                 except Exception as e:
-                    if _is_permanent_error(e):
+                    if _is_user_permanent_error(e):
                         _handle_permanent_error(user_id, e)
+                        return rows
+                    if _is_message_permanent_error(e):
+                        logging.warning(f"⚠️ Message-specific permanent error: {e}. Skipping retries for {user_id}.")
                         return rows
                     wait = _retry_after_seconds(e)
                     if wait is not None:
