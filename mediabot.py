@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-import telebot
+
 # Configure system-wide logging to stdout/stderr
 logging.basicConfig(
     level=logging.INFO,
@@ -601,6 +601,11 @@ def init_db():
             c.execute("""
                 INSERT INTO settings(key, value)
                 VALUES('force_join_message', '🚫 Please join our channel to use the bot.')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('link_detection', 'true')
                 ON CONFLICT DO NOTHING
             """)
             # =========================
@@ -1931,6 +1936,27 @@ def set_duplicate_filter(status: bool):
             """, ("true" if status else "false",))
 
 
+def is_link_detection_enabled():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT value FROM settings WHERE key='link_detection'")
+                row = c.fetchone()
+                return row and row[0] == "true"
+    except Exception:
+        return True
+
+
+def set_link_detection(status: bool):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO settings (key, value)
+                VALUES ('link_detection', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """, ("true" if status else "false",))
+
+
 def check_and_register_duplicate(file_id, sender_id):
     """
     Returns True if duplicate
@@ -3247,7 +3273,7 @@ def process_album_relay(album):
     user_id = first_msg.chat.id
     
     # Check if album contains link (exclude admins/vips/whitelisted)
-    if not is_admin(user_id) and not is_vip(user_id) and not is_whitelisted(user_id):
+    if is_link_detection_enabled() and not is_admin(user_id) and not is_vip(user_id) and not is_whitelisted(user_id):
         has_link = False
         link_msg = None
         for m in album:
@@ -3400,7 +3426,7 @@ def relay(message):
         return
 
     # Single message checks below:
-    if not is_admin(message.chat.id) and not is_vip(message.chat.id) and not is_whitelisted(message.chat.id):
+    if is_link_detection_enabled() and not is_admin(message.chat.id) and not is_vip(message.chat.id) and not is_whitelisted(message.chat.id):
         if contains_link(message):
             handle_link_violation(message)
             return
@@ -3585,6 +3611,30 @@ def duplicate_status(message):
 
     status = "ON" if is_duplicate_filter_enabled() else "OFF"
     bot.send_message(message.chat.id, f"♻ Duplicate filter is {status}")
+
+@bot.message_handler(commands=['linkcheck', 'linkdetection'])
+def linkcheck_command(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) > 1:
+        arg = parts[1].lower().strip()
+        if arg in ['on', 'enable', 'true', '1']:
+            set_link_detection(True)
+            bot.send_message(message.chat.id, "🔗 Link detection has been *enabled*.", parse_mode="Markdown")
+        elif arg in ['off', 'disable', 'false', '0']:
+            set_link_detection(False)
+            bot.send_message(message.chat.id, "🔗 Link detection has been *disabled*.", parse_mode="Markdown")
+        else:
+            bot.send_message(message.chat.id, "❌ Invalid argument. Use `/linkcheck on` or `/linkcheck off`.", parse_mode="Markdown")
+    else:
+        # Toggle mode
+        current = is_link_detection_enabled()
+        new_status = not current
+        set_link_detection(new_status)
+        status_str = "*enabled*" if new_status else "*disabled*"
+        bot.send_message(message.chat.id, f"🔗 Link detection has been {status_str}.", parse_mode="Markdown")
     
 @bot.message_handler(commands=['del'])
 def delete_command(message):
@@ -3802,6 +3852,10 @@ def _panel_moderation_markup():
     markup.add(
         InlineKeyboardButton("➕ Add Forward", callback_data="admin_addforward"),
         InlineKeyboardButton("⏳ Set Inactive", callback_data="admin_setinactive")
+    )
+    link_status = "ON 🟢" if is_link_detection_enabled() else "OFF 🔴"
+    markup.add(
+        InlineKeyboardButton(f"🔗 Link Check: {link_status}", callback_data="admin_toggle_links")
     )
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
     return markup
@@ -5277,6 +5331,28 @@ def admin_callbacks(call):
     elif data == "admin_close_join":
         set_join_status(False)
         bot.answer_callback_query(call.id, "Join closed.")
+
+    elif data == "admin_toggle_links":
+        current = is_link_detection_enabled()
+        new_status = not current
+        set_link_detection(new_status)
+        status_str = "Enabled" if new_status else "Disabled"
+        bot.answer_callback_query(call.id, f"🔗 Link Detection {status_str}!")
+        
+        # Refresh moderation panel
+        panel_text = (
+            "🚫 *MODERATION CENTER*\n"
+            "✕━━━━━━━━━━━━━━━━━━✕\n"
+            "Banning | Warnings | Filters\n"
+            "✕━━━━━━━━━━━━━━━━━━✕"
+        )
+        _panel_send_or_edit(
+            call.message.chat.id,
+            panel_text,
+            _panel_moderation_markup(),
+            message_id=call.message.message_id,
+        )
+        return
 
     elif data == "admin_clearmap":
         with get_connection() as conn:
