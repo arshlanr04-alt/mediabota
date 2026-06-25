@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-import telebot
+
 # Configure system-wide logging to stdout/stderr
 logging.basicConfig(
     level=logging.INFO,
@@ -4836,11 +4836,16 @@ def admin_menu(message):
     )
 @bot.callback_query_handler(func=lambda call: call.data == "check_join")
 def check_join_callback(call):
+    # Answer immediately to avoid "query is too old" timeout
+    try:
+        bot.answer_callback_query(call.id, "Checking membership...")
+    except Exception:
+        pass
+
     user_id = call.from_user.id
     msg = call.message
     joined, missing = is_user_joined_detailed(user_id, force_refresh=True)
     if joined:
-        bot.answer_callback_query(call.id, "✅ Verified!")
         with last_fw_msg_lock:
             last_fw_msg.pop(int(user_id), None)
             
@@ -4875,7 +4880,6 @@ def check_join_callback(call):
     else:
         missing_str = "\n".join([f"• {name}" for name in missing])
         prefix = f"⚠️ *Still missing membership in:*\n{missing_str}\n\nPlease join them and try again."
-        bot.answer_callback_query(call.id, "❌ You still need to join some channels.", show_alert=True)
         send_force_join_ui(user_id, prefix_text=prefix)
 
 @bot.chat_member_handler()
@@ -5184,17 +5188,22 @@ def firewall_ui_callbacks(call):
             return
 
         bot.answer_callback_query(call.id)
+        import html
+        name_esc = html.escape(str(target.get('name') or ''))
+        chat_id_esc = html.escape(str(target.get('chat_id') or ''))
+        link_esc = html.escape(str(target.get('invite_link') or 'Auto'))
+        
         text = (
-            f"📡 *Channel Details*\n\n"
-            f"📛 *Name:* {target['name']}\n"
-            f"🆔 *Chat ID:* `{target['chat_id']}`\n"
-            f"🔗 *Link:* {target['invite_link'] or 'Auto'}"
+            f"📡 <b>Channel Details</b>\n\n"
+            f"📛 <b>Name:</b> {name_esc}\n"
+            f"🆔 <b>Chat ID:</b> <code>{chat_id_esc}</code>\n"
+            f"🔗 <b>Link:</b> {link_esc}"
         )
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("🗑 Remove Channel", callback_data=f"fw_del:{target_id}"))
         markup.add(InlineKeyboardButton("🔙 Back to List", callback_data="fw_status"))
         
-        bot.edit_message_text(text, admin_chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        bot.edit_message_text(text, admin_chat_id, call.message.message_id, reply_markup=markup, parse_mode="HTML")
         return
 
     if data.startswith("fw_del:"):
