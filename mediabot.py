@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-
+import telebot
 # Configure system-wide logging to stdout/stderr
 logging.basicConfig(
     level=logging.INFO,
