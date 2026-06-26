@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-import telebot
+
 # Configure system-wide logging to stdout/stderr
 logging.basicConfig(
     level=logging.INFO,
@@ -884,62 +884,170 @@ def get_recovery_ban_for_username(username):
 def export_recovery_payload():
     with get_connection() as conn:
         with conn.cursor() as c:
+            # Export Users
             c.execute(
                 """
-                SELECT username, banned, first_name, last_name, admin_notes, reputation
+                SELECT user_id, username, banned, auto_banned, whitelisted, 
+                       activation_media_count, total_media_sent, last_activation_time, 
+                       restricted, referred_by, joined_at, first_name, last_name, 
+                       admin_notes, reputation, tg_username
                 FROM users
-                WHERE username IS NOT NULL
-                ORDER BY username
+                ORDER BY user_id
                 """
             )
             users = [{
-                "username": r[0],
-                "banned": bool(r[1]),
-                "first_name": r[2],
-                "last_name": r[3],
-                "admin_notes": r[4],
-                "reputation": r[5]
+                "user_id": r[0],
+                "username": r[1],
+                "banned": bool(r[2]) if r[2] is not None else False,
+                "auto_banned": bool(r[3]) if r[3] is not None else False,
+                "whitelisted": bool(r[4]) if r[4] is not None else False,
+                "activation_media_count": r[5] if r[5] is not None else 0,
+                "total_media_sent": r[6] if r[6] is not None else 0,
+                "last_activation_time": r[7],
+                "restricted": bool(r[8]) if r[8] is not None else False,
+                "referred_by": r[9],
+                "joined_at": r[10],
+                "first_name": r[11],
+                "last_name": r[12],
+                "admin_notes": r[13],
+                "reputation": r[14] if r[14] is not None else "Neutral",
+                "tg_username": r[15]
             } for r in c.fetchall()]
+
+            # Export Banned Words
             c.execute("SELECT word FROM banned_words ORDER BY word")
             words = [r[0] for r in c.fetchall()]
+
+            # Export Admins
+            c.execute("SELECT user_id FROM admins ORDER BY user_id")
+            admins = [r[0] for r in c.fetchall()]
+
+            # Export VIPs
+            c.execute("SELECT user_id FROM vip_users ORDER BY user_id")
+            vips = [r[0] for r in c.fetchall()]
+
+            # Export Settings
+            c.execute("SELECT key, value FROM settings ORDER BY key")
+            settings = {r[0]: r[1] for r in c.fetchall()}
+
     return {
-        "version": 1,
+        "version": 2,
         "exported_at": int(time.time()),
         "users": users,
         "banned_words": words,
+        "admins": admins,
+        "vip_users": vips,
+        "settings": settings,
     }
 
 
 def import_recovery_payload(payload):
     users = payload.get("users", [])
     words = payload.get("banned_words", [])
+    admins = payload.get("admins", [])
+    vips = payload.get("vip_users", [])
+    settings = payload.get("settings", {})
 
     imported_users = 0
     imported_words = 0
+    imported_admins = 0
+    imported_vips = 0
+    imported_settings = 0
+
     with get_connection() as conn:
         with conn.cursor() as c:
             for item in users:
-                username = str(item.get("username", "")).strip().lower()
-                if not username: continue
+                user_id = item.get("user_id")
+                username = item.get("username")
+                if username:
+                    username = str(username).strip().lower()
+                    if not username:
+                        username = None
+                else:
+                    username = None
+
                 banned = bool(item.get("banned", False))
                 fname = item.get("first_name")
                 lname = item.get("last_name")
                 notes = item.get("admin_notes")
                 rep = item.get("reputation", "Neutral")
 
-                c.execute("""
-                    INSERT INTO recovery_users (username, banned)
-                    VALUES (%s, %s)
-                    ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
-                """, (username, banned))
+                # If user_id is present (new recovery format)
+                if user_id is not None:
+                    try:
+                        user_id = int(user_id)
+                        auto_banned = bool(item.get("auto_banned", False))
+                        whitelisted = bool(item.get("whitelisted", False))
+                        activation_media_count = int(item.get("activation_media_count", 0))
+                        total_media_sent = int(item.get("total_media_sent", 0))
+                        last_activation_time = item.get("last_activation_time")
+                        if last_activation_time is not None:
+                            last_activation_time = int(last_activation_time)
+                        restricted = bool(item.get("restricted", False))
+                        referred_by = item.get("referred_by")
+                        if referred_by is not None:
+                            referred_by = int(referred_by)
+                        joined_at = item.get("joined_at")
+                        if joined_at is not None:
+                            joined_at = int(joined_at)
+                        tg_username = item.get("tg_username")
 
-                # Update main users table if they exist
-                c.execute("""
-                    UPDATE users
-                    SET banned = %s, first_name = %s, last_name = %s, admin_notes = %s, reputation = %s
-                    WHERE username = %s
-                """, (banned, fname, lname, notes, rep, username))
-                imported_users += 1
+                        c.execute("""
+                            INSERT INTO users (
+                                user_id, username, banned, auto_banned, whitelisted,
+                                activation_media_count, total_media_sent, last_activation_time,
+                                restricted, referred_by, joined_at, first_name, last_name,
+                                admin_notes, reputation, tg_username
+                            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                username = COALESCE(EXCLUDED.username, users.username),
+                                banned = EXCLUDED.banned,
+                                auto_banned = EXCLUDED.auto_banned,
+                                whitelisted = EXCLUDED.whitelisted,
+                                activation_media_count = EXCLUDED.activation_media_count,
+                                total_media_sent = EXCLUDED.total_media_sent,
+                                last_activation_time = COALESCE(EXCLUDED.last_activation_time, users.last_activation_time),
+                                restricted = EXCLUDED.restricted,
+                                referred_by = COALESCE(EXCLUDED.referred_by, users.referred_by),
+                                joined_at = COALESCE(EXCLUDED.joined_at, users.joined_at),
+                                first_name = EXCLUDED.first_name,
+                                last_name = EXCLUDED.last_name,
+                                admin_notes = EXCLUDED.admin_notes,
+                                reputation = EXCLUDED.reputation,
+                                tg_username = EXCLUDED.tg_username
+                        """, (
+                            user_id, username, banned, auto_banned, whitelisted,
+                            activation_media_count, total_media_sent, last_activation_time,
+                            restricted, referred_by, joined_at, fname, lname,
+                            notes, rep, tg_username
+                        ))
+
+                        if username:
+                            c.execute("""
+                                INSERT INTO recovery_users (username, banned)
+                                VALUES (%s, %s)
+                                ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
+                            """, (username, banned))
+
+                        imported_users += 1
+                    except Exception as e:
+                        logging.error(f"Error importing user {item}: {e}")
+                else:
+                    # Fallback for old recovery files without user_id
+                    if username:
+                        c.execute("""
+                            INSERT INTO recovery_users (username, banned)
+                            VALUES (%s, %s)
+                            ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
+                        """, (username, banned))
+
+                        # Update main users table if they exist
+                        c.execute("""
+                            UPDATE users
+                            SET banned = %s, first_name = %s, last_name = %s, admin_notes = %s, reputation = %s
+                            WHERE username = %s
+                        """, (banned, fname, lname, notes, rep, username))
+                        imported_users += 1
 
             for word in words:
                 clean_word = str(word).strip().lower()
@@ -951,6 +1059,44 @@ def import_recovery_payload(payload):
                 )
                 imported_words += 1
 
+            # Import Admins
+            for admin_id in admins:
+                try:
+                    admin_id = int(admin_id)
+                    c.execute(
+                        "INSERT INTO admins(user_id) VALUES(%s) ON CONFLICT DO NOTHING",
+                        (admin_id,),
+                    )
+                    imported_admins += 1
+                except Exception as e:
+                    logging.error(f"Error importing admin {admin_id}: {e}")
+
+            # Import VIPs
+            for vip_id in vips:
+                try:
+                    vip_id = int(vip_id)
+                    c.execute(
+                        "INSERT INTO vip_users(user_id) VALUES(%s) ON CONFLICT DO NOTHING",
+                        (vip_id,),
+                    )
+                    imported_vips += 1
+                except Exception as e:
+                    logging.error(f"Error importing VIP {vip_id}: {e}")
+
+            # Import Settings
+            if isinstance(settings, dict):
+                for k, v in settings.items():
+                    try:
+                        c.execute("""
+                            INSERT INTO settings(key, value)
+                            VALUES(%s, %s)
+                            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                        """, (k, str(v)))
+                        imported_settings += 1
+                    except Exception as e:
+                        logging.error(f"Error importing setting {k}: {e}")
+
+            # Run recovery users banned status sync to main users
             c.execute(
                 """
                 UPDATE users u
@@ -960,7 +1106,7 @@ def import_recovery_payload(payload):
                 """
             )
 
-    return imported_users, imported_words
+    return imported_users, imported_words, imported_admins, imported_vips, imported_settings
 # =========================
 # 👑 ADMIN HELPERS
 # =========================
@@ -3451,11 +3597,18 @@ def import_recovery_document(message):
         file_info = bot.get_file(message.document.file_id)
         raw = bot.download_file(file_info.file_path)
         payload = json.loads(raw.decode("utf-8"))
-        imported_users, imported_words = import_recovery_payload(payload)
+        imported_users, imported_words, imported_admins, imported_vips, imported_settings = import_recovery_payload(payload)
         pending_recovery_import.discard(message.chat.id)
+        refresh_caches()
         bot.send_message(
             message.chat.id,
-            f"Recovery import complete.\nUsers imported: {imported_users}\nBanned words imported: {imported_words}",
+            f"✅ *Recovery Import Complete!*\n\n"
+            f"👤 Users imported: {imported_users}\n"
+            f"🚫 Banned words: {imported_words}\n"
+            f"👑 Admins: {imported_admins}\n"
+            f"⭐ VIPs: {imported_vips}\n"
+            f"⚙️ Settings: {imported_settings}",
+            parse_mode="Markdown"
         )
     except Exception as e:
         bot.send_message(message.chat.id, f"Import failed: {e}")
@@ -5950,7 +6103,7 @@ def admin_callbacks(call):
                 json.dump(payload, f, ensure_ascii=False, indent=2)
                 temp_path = f.name
             with open(temp_path, "rb") as doc:
-                bot.send_document(call.message.chat.id, doc, caption="Recovery export (username+banned+banned_words)")
+                bot.send_document(call.message.chat.id, doc, caption="Recovery export (users, banned words, admins, VIPs, settings)")
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
