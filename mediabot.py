@@ -2556,6 +2556,9 @@ def _copy_message_with_retry(user_id, sender_id, message_id, reply_to_message_id
                 logging.warning(f"⚠️ Message-specific permanent error: {e}. Skipping retries for {user_id}.")
                 return None
             wait = _retry_after_seconds(e)
+            if wait is not None and wait > 30:
+                logging.warning(f"❌ Rate limit is too high ({wait}s > 30s) to copy message to {user_id}. Aborting.")
+                return None
             if i < attempts - 1:
                 if wait is not None:
                     time.sleep(max(0.05, wait))
@@ -2589,6 +2592,9 @@ def _forward_message_with_retry(user_id, sender_id, message_id, **kwargs):
                 logging.warning(f"⚠️ Message-specific permanent error: {e}. Skipping retries for {user_id}.")
                 return None
             wait = _retry_after_seconds(e)
+            if wait is not None and wait > 30:
+                logging.warning(f"❌ Rate limit is too high ({wait}s > 30s) to forward message to {user_id}. Aborting.")
+                return None
             if i < attempts - 1:
                 if wait is not None:
                     time.sleep(max(0.05, wait))
@@ -2640,6 +2646,9 @@ def _send_text_with_retry(user_id, text, reply_to_message_id=None):
                 logging.warning(f"⚠️ Message-specific permanent error: {e}. Skipping retries for {user_id}.")
                 return None
             wait = _retry_after_seconds(e)
+            if wait is not None and wait > 30:
+                logging.warning(f"❌ Rate limit is too high ({wait}s > 30s) to send text message to {user_id}. Aborting.")
+                return None
             if i < attempts - 1:
                 if wait is not None:
                     time.sleep(max(0.05, wait))
@@ -2933,6 +2942,7 @@ def _process_album(messages):
             for i in range(attempts):
                 try:
                     sent_msgs = bot.send_media_group(user_id, chunk_media)
+                    logging.info(f"✅ Successfully sent album chunk to {user_id} from {sender_id}")
                     if store_mapping and sent_msgs:
                         for sent, original_message_id in zip(sent_msgs, [item[1] for item in chunk]):
                             rows.append((sent.message_id, sender_id, original_message_id, user_id, now))
@@ -2946,12 +2956,16 @@ def _process_album(messages):
                         return rows
                     wait = _retry_after_seconds(e)
                     if wait is not None:
-                        print(f"Album 429 rate-limit: waiting {wait}s before retry")
+                        if wait > 30:
+                            logging.warning(f"❌ Album rate limit is too high ({wait}s > 30s) to {user_id}. Aborting send.")
+                            return rows
+                        logging.warning(f"⚠️ Album 429 rate-limit for {user_id}: waiting {wait}s before retry")
                         time.sleep(max(1.0, wait))
                     elif i < attempts - 1:
+                        logging.info(f"⚠️ Album send chunk to {user_id} failed, retrying in {0.3 * (i + 1)}s... Error: {e}")
                         time.sleep(0.3 * (i + 1))
                     else:
-                        print("Album send_media_group error:", e)
+                        logging.error(f"❌ Album send_media_group to {user_id} failed after {attempts} attempts. Error: {e}")
                     continue
         return rows
 
@@ -3427,6 +3441,24 @@ def process_album_relay(album):
         "type": "album",
         "messages": filtered_album
     })
+
+@bot.message_handler(
+    func=lambda m: is_admin(m.chat.id) and m.chat.id in pending_recovery_import,
+    content_types=['document']
+)
+def import_recovery_document(message):
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        raw = bot.download_file(file_info.file_path)
+        payload = json.loads(raw.decode("utf-8"))
+        imported_users, imported_words = import_recovery_payload(payload)
+        pending_recovery_import.discard(message.chat.id)
+        bot.send_message(
+            message.chat.id,
+            f"Recovery import complete.\nUsers imported: {imported_users}\nBanned words imported: {imported_words}",
+        )
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Import failed: {e}")
 
 @bot.message_handler(
     func=lambda m: not m.text or not m.text.startswith('/'),
@@ -5967,25 +5999,7 @@ def admin_direct_message(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Failed to send: {e}")
 
-@bot.message_handler(content_types=['document'])
-def import_recovery_document(message):
-    if not is_admin(message.chat.id):
-        return
-    if message.chat.id not in pending_recovery_import:
-        return
 
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        raw = bot.download_file(file_info.file_path)
-        payload = json.loads(raw.decode("utf-8"))
-        imported_users, imported_words = import_recovery_payload(payload)
-        pending_recovery_import.discard(message.chat.id)
-        bot.send_message(
-            message.chat.id,
-            f"Recovery import complete.\nUsers imported: {imported_users}\nBanned words imported: {imported_words}",
-        )
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Import failed: {e}")
 
 
 @bot.message_handler(commands=['chatid'], content_types=['text'])
@@ -6111,7 +6125,7 @@ def run_webhook_server():
                 self.end_headers()
                 self.wfile.write(b"OK")
             else:
-                self.send_response(404)
+                self.send_response(404)a
                 self.end_headers()
 
         def log_message(self, format, *args):
