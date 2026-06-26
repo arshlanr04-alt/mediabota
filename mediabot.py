@@ -2265,21 +2265,25 @@ def handle_restrictions(message):
 
     user_id = message.chat.id
     state = get_user_state(user_id)
+    logging.info(f"🔒 Checking restrictions for user {user_id}. State: {state}")
 
     # 🛡️ Force Join Check (Firewall)
     if is_force_join_enabled():
         if not is_user_joined(user_id):
+            logging.info(f"🚫 User {user_id} blocked: Not joined forced channels.")
             if can_send_force_join_reminder(user_id):
                 send_force_join_ui(user_id)
             return True
 
     # 🚫 Manual Ban
     if state == "BANNED":
+        logging.info(f"🚫 User {user_id} blocked: User is BANNED.")
         safe_send_message(user_id, "🚫 You are banned.")
         return True
 
     # 🚫 Temporary Restriction
     if state == "RESTRICTED":
+        logging.info(f"🚫 User {user_id} blocked: User is RESTRICTED.")
         safe_send_message(user_id, "🚫 You are temporarily restricted by the system.")
         return True
 
@@ -2316,6 +2320,7 @@ def handle_restrictions(message):
 
     # ❌ No Username Yet
     if state == "NO_USERNAME":
+        logging.info(f"🚫 User {user_id} blocked: User has NO_USERNAME.")
         safe_send_message(
             user_id,
             "⚠️ Please set username first using /start."
@@ -2365,6 +2370,7 @@ def handle_restrictions(message):
 
             return False  # allow media relay
 
+        logging.info(f"🚫 User {user_id} blocked: User in JOINING state sent non-media message.")
         safe_send_message(
             user_id,
             f"🔒 Send {REQUIRED_MEDIA} media to join."
@@ -2415,6 +2421,7 @@ def handle_restrictions(message):
 
             return False
 
+        logging.info(f"🚫 User {user_id} blocked: User in INACTIVE state sent non-media message.")
         safe_send_message(
             user_id,
             f"⏳ You are inactive.\nSend {REQUIRED_MEDIA} media to reactivate."
@@ -2741,10 +2748,12 @@ def _process_single(message):
             ]
     extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
     targets = list(dict.fromkeys(receivers + extra_targets))
+    logging.info(f"📤 Processing single message from {sender_id} (type: {message.content_type}). Receivers: {len(receivers)}, Extra targets: {len(extra_targets)}, Total targets: {len(targets)}")
     store_mapping = should_store_mapping(sender_id, targets)
     mappings = []
     now = int(time.time())
     if not targets:
+        logging.info(f"⚠️ No targets found to relay message from {sender_id}. Receivers: {receivers}, Extra targets: {extra_targets}")
         return
     reply_map = {}
     if getattr(message, "reply_to_message", None):
@@ -2848,10 +2857,12 @@ def _process_album(messages):
             ]
     extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
     targets = list(dict.fromkeys(receivers + extra_targets))
+    logging.info(f"📤 Processing album from {sender_id} (size: {len(messages)}). Receivers: {len(receivers)}, Extra targets: {len(extra_targets)}, Total targets: {len(targets)}")
     store_mapping = should_store_mapping(sender_id, targets)
     mappings = []
     now = int(time.time())
     if not targets:
+        logging.info(f"⚠️ No targets found to relay album from {sender_id}. Receivers: {receivers}, Extra targets: {extra_targets}")
         return
     media_caption = get_media_caption()
     username = get_username(sender_id) or 'Unknown'
@@ -3416,6 +3427,7 @@ def process_album_relay(album):
     content_types=['text', 'photo', 'video', 'document', 'audio', 'animation']
 )
 def relay(message):
+    logging.info(f"📥 Received message from user {message.chat.id} (content_type: {message.content_type}, media_group_id: {message.media_group_id})")
     # =========================================================================
     # 🆕 IMMEDIATE ALBUM GROUPING (Must be at the top to prevent splitting!)
     # =========================================================================
