@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-import telebot
+
 # Configure system-wide logging to stdout/stderr
 logging.basicConfig(
     level=logging.INFO,
@@ -2725,7 +2725,12 @@ def broadcast_worker():
 def _process_single(message):
 
     sender_id = message.chat.id
-    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    sender_name = get_username(sender_id) or getattr(message.from_user, "username", None) or "Unknown"
+    logging.info(f"📥 Processing single message relay from {sender_name} ({sender_id})")
+
+    all_receivers = get_receivers_cached()
+    receivers = [uid for uid in all_receivers if uid != sender_id]
+    logging.info(f"📊 Active receivers cached count: {len(all_receivers)} (excluding sender: {len(receivers)})")
     
     if is_force_join_enabled():
         with get_connection() as conn:
@@ -2735,16 +2740,21 @@ def _process_single(message):
         
         # Use cached sets for extremely fast filtering
         with cache_lock:
+            before_count = len(receivers)
             receivers = [
                 uid for uid in receivers
                 if uid in cached_admins or uid in cached_vips or tracking_data.get(uid, False)
             ]
+            logging.info(f"🛡️ Force Join filter: reduced receivers from {before_count} to {len(receivers)}")
     extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
     targets = list(dict.fromkeys(receivers + extra_targets))
+    logging.info(f"🎯 Total relay targets (active users + forward channels): {len(targets)}")
+    
     store_mapping = should_store_mapping(sender_id, targets)
     mappings = []
     now = int(time.time())
     if not targets:
+        logging.warning("⚠️ No active targets/receivers available to relay this message.")
         return
     reply_map = {}
     if getattr(message, "reply_to_message", None):
@@ -2832,8 +2842,13 @@ def _process_single(message):
 def _process_album(messages):
 
     sender_id = messages[0].chat.id
-    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
-    
+    sender_name = get_username(sender_id) or getattr(messages[0].from_user, "username", None) or "Unknown"
+    logging.info(f"📥 Processing album relay ({len(messages)} items) from {sender_name} ({sender_id})")
+
+    all_receivers = get_receivers_cached()
+    receivers = [uid for uid in all_receivers if uid != sender_id]
+    logging.info(f"📊 Active receivers cached count: {len(all_receivers)} (excluding sender: {len(receivers)})")
+
     if is_force_join_enabled():
         with get_connection() as conn:
             with conn.cursor() as c:
@@ -2842,16 +2857,21 @@ def _process_album(messages):
         
         # Use cached sets for extremely fast filtering
         with cache_lock:
+            before_count = len(receivers)
             receivers = [
                 uid for uid in receivers
                 if uid in cached_admins or uid in cached_vips or tracking_data.get(uid, False)
             ]
+            logging.info(f"🛡️ Force Join filter: reduced receivers from {before_count} to {len(receivers)}")
     extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
     targets = list(dict.fromkeys(receivers + extra_targets))
+    logging.info(f"🎯 Total relay targets (active users + forward channels): {len(targets)}")
+
     store_mapping = should_store_mapping(sender_id, targets)
     mappings = []
     now = int(time.time())
     if not targets:
+        logging.warning("⚠️ No active targets/receivers available to relay this album.")
         return
     media_caption = get_media_caption()
     username = get_username(sender_id) or 'Unknown'
@@ -3416,6 +3436,7 @@ def process_album_relay(album):
     content_types=['text', 'photo', 'video', 'document', 'audio', 'animation']
 )
 def relay(message):
+    logging.info(f"📩 Incoming relay message: type={message.content_type}, chat_id={message.chat.id}, media_group_id={message.media_group_id}")
     # =========================================================================
     # 🆕 IMMEDIATE ALBUM GROUPING (Must be at the top to prevent splitting!)
     # =========================================================================
