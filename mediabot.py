@@ -2544,6 +2544,7 @@ def _copy_message_with_retry(user_id, sender_id, message_id, reply_to_message_id
                 reply_to_message_id=reply_to_message_id,
                 **kwargs
             )
+            logging.info(f"✅ Successfully copied message to {user_id} from {sender_id}")
             if FORWARD_DELAY > 0:
                 time.sleep(FORWARD_DELAY)
             return sent
@@ -2561,6 +2562,7 @@ def _copy_message_with_retry(user_id, sender_id, message_id, reply_to_message_id
                 else:
                     time.sleep(0.15 * (i + 1))
                 continue
+            logging.warning(f"❌ Copy message failed to {user_id} after {attempts} attempts. Error: {e}")
             return None
     return None
 
@@ -2575,6 +2577,7 @@ def _forward_message_with_retry(user_id, sender_id, message_id, **kwargs):
                 message_id=message_id,
                 **kwargs
             )
+            logging.info(f"✅ Successfully forwarded message to {user_id} from {sender_id}")
             if FORWARD_DELAY > 0:
                 time.sleep(FORWARD_DELAY)
             return sent
@@ -2592,6 +2595,7 @@ def _forward_message_with_retry(user_id, sender_id, message_id, **kwargs):
                 else:
                     time.sleep(0.15 * (i + 1))
                 continue
+            logging.warning(f"❌ Forward message failed to {user_id} after {attempts} attempts. Error: {e}")
             return None
     return None
 
@@ -2624,6 +2628,7 @@ def _send_text_with_retry(user_id, text, reply_to_message_id=None):
     for i in range(attempts):
         try:
             sent = bot.send_message(user_id, text, reply_to_message_id=reply_to_message_id)
+            logging.info(f"✅ Successfully sent text message to {user_id}")
             if FORWARD_DELAY > 0:
                 time.sleep(FORWARD_DELAY)
             return sent
@@ -2641,6 +2646,7 @@ def _send_text_with_retry(user_id, text, reply_to_message_id=None):
                 else:
                     time.sleep(0.15 * (i + 1))
                 continue
+            logging.warning(f"❌ Send text message failed to {user_id} after {attempts} attempts. Error: {e}")
             return None
     return None
 
